@@ -4,15 +4,13 @@ from pathlib import Path
 
 import fitz
 import pdfplumber
-import google.generativeai as genai
 from PIL import Image, ImageChops, ImageStat
 from playwright.async_api import async_playwright
 
 from app.core.config import settings
 from app.storage import get_gcs_client
+from app.ai.gemini_client import model_pro
 from app.ai.rate_limiter import acquire
-
-genai.configure(api_key=settings.GEMINI_API_KEY)
 
 PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "stage3_template" / "v1.0.0.txt"
 PROMPT_VERSION = "v1.0.0"
@@ -149,9 +147,8 @@ async def _call_gemini_vision(
     if not allowed:
         raise RuntimeError("Rate limit 초과. Celery 재시도 대기 중.")
 
-    model = genai.GenerativeModel(MODEL)
     image_part = {"mime_type": mime_type, "data": image_bytes}
-    response = await model.generate_content_async([prompt, image_part])
+    response = await model_pro.generate_content_async([prompt, image_part])
     return response.text
 
 
@@ -363,10 +360,9 @@ async def _refine_schema(
         return schema
 
     try:
-        model = genai.GenerativeModel(MODEL)
         b_part = {"mime_type": mime_type, "data": b_image_bytes}
         rendered_part = {"mime_type": "image/png", "data": rendered_bytes}
-        response = await model.generate_content_async([refine_prompt, b_part, rendered_part])
+        response = await model_pro.generate_content_async([refine_prompt, b_part, rendered_part])
         result = _parse_schema(response.text)
         return result["data"] if result["success"] else schema
     except Exception:
