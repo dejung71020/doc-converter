@@ -2,12 +2,8 @@ import json
 import asyncio
 from pathlib import Path
 
-import google.generativeai as genai
-
-from app.core.config import settings
+from app.ai.gemini_client import model_pro, model_flash
 from app.ai.rate_limiter import acquire
-
-genai.configure(api_key=settings.GEMINI_API_KEY)
 
 PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "stage4_mapping" / "v1.0.0.txt"
 PROMPT_VERSION = "v1.0.0"
@@ -113,7 +109,7 @@ async def _call_gemini(prompt: str, model: str, estimated_tokens: int) -> str:
     if not allowed:
         raise RuntimeError(f"Rate limit 초과 ({model}). Celery 재시도 대기 중.")
 
-    gemini_model = genai.GenerativeModel(model)
+    gemini_model = model_pro if model == MODEL_PRO else model_flash
     response = await gemini_model.generate_content_async(prompt)
     return response.text
 
