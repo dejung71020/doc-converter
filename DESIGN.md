@@ -453,37 +453,58 @@ WS     /ws/v1/jobs/:id
 
 ```
 [Stage 2: A 콘텐츠 추출]
-모델: Gemini 1.5 Pro (이미지 A) / PyMuPDF + Flash (텍스트 PDF A)
+모델: Gemini 1.5 Pro (이미지 A) / PyMuPDF + Pro (텍스트 PDF A)
 프롬프트 전략:
   - 문서 타입 자동 감지 (보고서/이력서/계약서 등)
   - 섹션별 구조화된 JSON 추출
   - 각 필드에 신뢰도 스코어 부여
 출력: { doc_type, sections: [{ name, content, confidence }] }
 
-[Stage 3: B 템플릿 분석]
-모델: Gemini 1.5 Pro (최고 정확도 필수)
-처리:
-  - B의 레이아웃 구조 추출 (컬럼, 섹션, 필드 위치)
-  - 폰트 크기 계층 감지 (H1/H2/본문 구분)
-  - 색상 팔레트 추출
-  - 필수 필드 vs 선택 필드 구분
-  - HTML/CSS 템플릿으로 변환
-  - 레이아웃 복잡도 스코어 산출 (WeasyPrint 한계 대응)
+[Stage 3: B 템플릿 분석] ← 최우선 정확도 단계
+모델: Gemini 1.5 Pro 전용 (Flash 완전 배제)
+
+B 파일 타입별 처리 경로:
+  B가 PDF →
+    1단계: pdfplumber로 폰트명/정확한 좌표/텍스트 구조 추출 (무료, 정확)
+    2단계: 1페이지 이미지 변환 → Gemini Vision으로 시각적 스타일 보완
+    → PDF는 폰트명을 직접 추출 가능하므로 이미지보다 정확도 높음
+
+  B가 이미지 →
+    Gemini Vision 단독 분석
+    → 폰트는 Google Fonts 유사 후보 3개 추정 제공
+
+자기검증 루프 (Self-Verification Loop):
+  1차: Gemini Vision으로 JSON 스키마 추출
+  2차: 추출된 JSON으로 HTML/CSS 생성 → Playwright로 렌더링
+  3차: 렌더링 결과와 원본 B 픽셀 Diff 측정
+  4차: 유사도 95% 미만 → 차이 영역만 크롭해서 Gemini에 재분석 요청 → JSON 보정
+  최대 2회 반복 후 비주얼 에디터로 사용자 전달
 
 레이아웃 복잡도 스코어 계산:
-  절대 위치 요소 수       × 15점
-  컬럼 수 (3 이상)        × 10점
-  중첩 테이블 깊이        × 20점
-  커스텀 폰트 수          × 5점
-  CSS Grid/Flexbox 사용  × 10점
+  절대 위치 요소 수            × 15점
+  컬럼 수 (3 이상)             × 10점
+  중첩 테이블 깊이             × 20점
+  커스텀 폰트 수               × 5점
+  CSS Grid/Flexbox 적용 구역 수 × 10점
 
 렌더러 결정:
-  스코어 0~40   → WeasyPrint (기본)
-  스코어 40~70  → WeasyPrint + 사용자 경고 배너
+  스코어 0~40   → WeasyPrint
+  스코어 40~70  → WeasyPrint + 사용자 경고
   스코어 70+    → Playwright (headless Chrome) 자동 선택
-                  "복잡한 레이아웃이 감지되어 고품질 렌더러를 사용합니다."
 
-출력: { fields: [...], html_template, css, layout_complexity_score, renderer: 'weasyprint'|'playwright' }
+출력:
+  {
+    fields: [...],
+    layout: { columns, page_padding, background_color },
+    page_size: { format, width_px, height_px },
+    font_candidates: [...],
+    css_features: [...],
+    complexity_score: int,
+    preferred_renderer: 'weasyprint'|'playwright',
+    html_template: str,
+    verification_score: float,   ← 자기검증 루프 최종 픽셀 유사도
+    verification_attempts: int,  ← 반복 횟수
+  }
 ```
 
 ### Stage 4: 의미론적 매핑 (앙상블)

@@ -37,3 +37,8 @@ golden_dataset/
 *.jpeg
 *.png
 !frontend/public/**
+
+# gcs
+gcs-key.json
+
+test/
