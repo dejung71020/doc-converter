@@ -247,6 +247,8 @@ async def run(job_id: str, stage2_result: dict, stage3_result: dict) -> dict:
         )
     except RuntimeError as e:
         return {**FAILURE_BASE, "error": str(e)}
+    except Exception as e:
+        return {**FAILURE_BASE, "error": f"Gemini 호출 실패: {str(e)}"}
 
     flash_parsed = _parse_mapping(flash_raw)
     pro_parsed = _parse_mapping(pro_raw)

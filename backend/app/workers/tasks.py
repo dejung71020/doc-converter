@@ -185,9 +185,19 @@ def run_conversion_job(
         return asyncio.run(
             _run_pipeline(job_id, a_file_path, a_filename, b_file_path, b_filename)
         )
-    except Exception as exc:
+    except RuntimeError as exc:
+        # Rate Limit 또는 파이프라인 Stage 실패 → 재시도
         asyncio.run(_publish_event(job_id, {
             "type": "job_failed",
             "error": str(exc),
+            "will_retry": self.request.retries < self.max_retries,
+        }))
+        raise self.retry(exc=exc)
+    except Exception as exc:
+        # 예상치 못한 오류 → 재시도하되 마지막 시도면 최종 실패 처리
+        asyncio.run(_publish_event(job_id, {
+            "type": "job_failed",
+            "error": f"예기치 않은 오류: {str(exc)}",
+            "will_retry": self.request.retries < self.max_retries,
         }))
         raise self.retry(exc=exc)
