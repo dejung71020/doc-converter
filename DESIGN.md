@@ -622,21 +622,30 @@ Self-RAG 환각 검증 (콘텐츠 생성 직후):
 출력: 초안 PDF + HTML 미리보기
 ```
 
-### Stage 7: 형식 검증
+### Stage 7: 형식 검증 + PII 복원
 
 ```
-모델: Gemini 1.5 Pro
-검증 항목:
-  1. 레이아웃 Diff: B 원본 이미지 vs 생성 PDF 렌더링 비교
-     → 픽셀 유사도 95% 미만 시 → 해당 섹션 재조립
-  2. 필드 완성도: 모든 required 필드 채워짐 확인
-  3. 텍스트 오버플로우: 텍스트가 박스 밖으로 나가는지 확인
-  4. 시각적 품질 스코어 산출 (0~100)
+검증 방식: SSIM (Structural Similarity Index)
+  - PIL mean diff 대비 인간 시각 기준 유사도를 더 정확하게 측정
+  - 밝기/대비/구조를 분리 측정 → 약간의 밝기 차이로 인한 오탐 방지
 
-스코어 기준:
-  95 이상  → 자동 완료
-  85~95   → Human Checkpoint #2 권장
-  85 미만  → Human Checkpoint #2 필수
+SSIM 스코어 기준:
+  98% 이상 → 자동 완료
+  90~98%   → 비주얼 에디터 권장
+  90% 미만 → 비주얼 에디터 필수
+
+PII 복원:
+  stage1_5_pii.restore() 호출 → Redis 토큰맵으로 원본값 치환
+  Redis 키 삭제 안 함 (Celery 재시도 대비, TTL 1시간 자동 소멸)
+
+멀티페이지 지원:
+  Playwright PDF 생성 시 height 미지정 → 콘텐츠 길이에 따라 자동 페이지 분할
+
+[v2.0 예정] 복합 유사도 스코어:
+  SSIM만으로는 텍스트 내용이 달라도 레이아웃이 비슷하면 높은 점수 가능.
+  다음 조합으로 정밀도 향상 예정:
+    final_score = 0.5 × SSIM + 0.3 × layout_bbox_score + 0.2 × ocr_text_alignment
+  추가 의존성: pytesseract (OCR), OpenCV (bounding box)
 ```
 
 ### Human Checkpoint #2: 시각적 Diff 확인
