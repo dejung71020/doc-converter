@@ -43,7 +43,7 @@ class ConversionProfile(Base):
     )
     preferred_renderer: Mapped[str] = mapped_column(
         String(20), default="playwright",
-        comment="사용할 렌더러: playwright | weasyprint"
+        comment="사용할 렌더러: 현재 항상 playwright"
     )
     font_candidates: Mapped[dict | None] = mapped_column(
         JSONB, nullable=True,

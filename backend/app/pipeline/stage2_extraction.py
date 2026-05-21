@@ -7,6 +7,7 @@ from app.ai.rate_limiter import acquire
 PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "stage2_extraction" / "v1.0.0.txt"
 PROMPT_VERSION = "v1.0.0"
 MODEL = "gemini-1.5-pro"
+_PROMPT_TEMPLATE = PROMPT_PATH.read_text(encoding="utf-8")
 
 def _load_prompt(document_text: str) -> str:
     """
@@ -19,7 +20,7 @@ def _load_prompt(document_text: str) -> str:
     Returns:
         {{DOCUMENT_TEXT}} 가 치환된 최종 프롬프트
     """
-    template = PROMPT_PATH.read_text(encoding="utf-8")
+    template = _PROMPT_TEMPLATE
     return template.replace("{{DOCUMENT_TEXT}}", document_text)
 
 async def _call_gemini(prompt: str, estimated_tokens: int) -> str:

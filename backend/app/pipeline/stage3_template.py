@@ -3,9 +3,11 @@ import io
 from pathlib import Path
 
 import fitz
+import numpy as np
 import pdfplumber
-from PIL import Image, ImageChops, ImageStat
+from PIL import Image
 from playwright.async_api import async_playwright
+from skimage.metrics import structural_similarity
 
 from app.core.config import settings
 from app.storage import get_gcs_client
@@ -15,6 +17,7 @@ from app.ai.rate_limiter import acquire
 PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "stage3_template" / "v1.0.0.txt"
 PROMPT_VERSION = "v1.0.0"
 MODEL = "gemini-1.5-pro"
+_PROMPT_TEMPLATE = PROMPT_PATH.read_text(encoding="utf-8")
 MAX_VERIFICATION_ATTEMPTS = 2
 VERIFICATION_THRESHOLD = 95.0
 
@@ -120,7 +123,7 @@ def _load_prompt(context: str) -> str:
     Returns:
         완성된 프롬프트 문자열
     """
-    template = PROMPT_PATH.read_text(encoding="utf-8")
+    template = _PROMPT_TEMPLATE
     return template.replace("{{TEMPLATE_DATA}}", context)
 
 
@@ -253,38 +256,42 @@ body {{
 </html>"""
 
 
-async def _render_html(html: str) -> bytes:
+async def _render_html(html: str, page_width: int = 794, page_height: int = 1123) -> bytes:
     """
     Playwright headless Chrome으로 HTML을 렌더링해 스크린샷을 반환한다.
-    자기검증 루프에서 렌더링 결과와 원본 B를 픽셀 비교하는 데 사용한다.
+    자기검증 루프에서 렌더링 결과와 원본 B를 SSIM 비교하는 데 사용한다.
+    Stage 7과 동일한 타임아웃(30초)과 폰트 로딩 대기를 적용한다.
 
     Args:
         html: 렌더링할 HTML 문자열
+        page_width: 페이지 너비 px (Stage 3 추출 page_size 기반)
+        page_height: 페이지 높이 px
 
     Returns:
         PNG 스크린샷 바이트
     """
     async with async_playwright() as p:
         browser = await p.chromium.launch()
-        page = await browser.new_page(viewport={"width": 794, "height": 1123})
-        await page.set_content(html, wait_until="networkidle", timeout=10000)
-        screenshot = await page.screenshot(full_page=False)
+        page = await browser.new_page(viewport={"width": page_width, "height": page_height})
+        await page.set_content(html, wait_until="networkidle", timeout=30000)
+        await page.evaluate("document.fonts.ready")
+        screenshot = await page.screenshot(full_page=True)
         await browser.close()
     return screenshot
 
 
-def _pixel_similarity(img1_bytes: bytes, img2_bytes: bytes) -> float:
+def _ssim_similarity(img1_bytes: bytes, img2_bytes: bytes) -> float:
     """
-    두 이미지의 픽셀 유사도를 0~100 사이의 점수로 반환한다.
-    PIL ImageChops.difference로 차이를 계산하고 평균 오차를 유사도로 변환한다.
-    크기가 다르면 img2를 img1 크기로 리사이즈해 비교한다.
+    SSIM(Structural Similarity Index)으로 두 이미지의 시각적 유사도를 반환한다.
+    Stage 7과 동일한 알고리즘을 사용해 자기검증 루프와 최종 검증의 기준을 일치시킨다.
+    PIL mean diff 대비 인간 시각 기준의 유사도를 더 정확하게 측정한다.
 
     Args:
         img1_bytes: 기준 이미지 (원본 B)
         img2_bytes: 비교 이미지 (렌더링 결과)
 
     Returns:
-        픽셀 유사도 (0.00 ~ 100.00)
+        SSIM 유사도 (0.00 ~ 100.00)
     """
     img1 = Image.open(io.BytesIO(img1_bytes)).convert("RGB")
     img2 = Image.open(io.BytesIO(img2_bytes)).convert("RGB")
@@ -292,31 +299,28 @@ def _pixel_similarity(img1_bytes: bytes, img2_bytes: bytes) -> float:
     if img1.size != img2.size:
         img2 = img2.resize(img1.size, Image.Resampling.LANCZOS)
 
-    diff = ImageChops.difference(img1, img2)
-    stat = ImageStat.Stat(diff)
-    mean_diff = sum(stat.mean) / 3
-    similarity = (1 - mean_diff / 255) * 100
+    arr1 = np.array(img1)
+    arr2 = np.array(img2)
+    score, _ = structural_similarity(arr1, arr2, channel_axis=2, full=True)
+    similarity = score * 100
 
     return round(similarity, 2)
 
 
-def _select_renderer(complexity_score: int) -> tuple[str, str | None]:
+def _get_complexity_warning(complexity_score: int) -> str | None:
     """
-    complexity_score를 기반으로 렌더러와 경고 메시지를 반환한다.
-    스코어 0~40: WeasyPrint / 40~70: WeasyPrint + 경고 / 70+: Playwright
+    complexity_score를 기반으로 사용자에게 표시할 경고 메시지를 반환한다.
+    렌더러는 항상 Playwright를 사용하며, 복잡도가 높을수록 처리 시간이 길어질 수 있음을 안내한다.
 
     Args:
         complexity_score: Stage 3에서 산출된 레이아웃 복잡도 점수
 
     Returns:
-        (renderer 이름, 경고 메시지 or None)
+        경고 메시지 or None
     """
-    if complexity_score < 40:
-        return "weasyprint", None
-    elif complexity_score < 70:
-        return "weasyprint", "레이아웃이 다소 복잡합니다. 일부 요소가 정확히 재현되지 않을 수 있습니다."
-    else:
-        return "playwright", None
+    if complexity_score >= 70:
+        return "레이아웃이 매우 복잡합니다. 처리 시간이 다소 길어질 수 있습니다."
+    return None
 
 
 async def _refine_schema(
@@ -409,9 +413,9 @@ async def run(job_id: str, b_file_path: str, b_filename: str) -> dict:
         "success": False,
         "schema": {},
         "html_template": "",
-        "preferred_renderer": "playwright",
-        "renderer_warning": None,
+        "b_image_bytes": b"",
         "complexity_score": 0,
+        "complexity_warning": None,
         "verification_score": 0.0,
         "verification_attempts": 0,
         "prompt_version": PROMPT_VERSION,
@@ -445,9 +449,14 @@ async def run(job_id: str, b_file_path: str, b_filename: str) -> dict:
 
     schema = parsed["data"]
     complexity_score = schema.get("complexity_score", 0)
-    preferred_renderer, renderer_warning = _select_renderer(complexity_score)
+    complexity_warning = _get_complexity_warning(complexity_score)
 
     # 자기검증 루프 (최대 2회)
+    # schema에서 추출한 page_size로 렌더링해 B 원본과 정확히 같은 크기로 비교
+    page_size = schema.get("page_size", {"width_px": 794, "height_px": 1123})
+    page_width = page_size.get("width_px", 794)
+    page_height = page_size.get("height_px", 1123)
+
     verification_score = 0.0
     verification_attempts = 0
     html_template = ""
@@ -457,8 +466,8 @@ async def run(job_id: str, b_file_path: str, b_filename: str) -> dict:
         html_template = _build_html_template(schema)
 
         try:
-            rendered_bytes = await _render_html(html_template)
-            verification_score = _pixel_similarity(b_image_bytes, rendered_bytes)
+            rendered_bytes = await _render_html(html_template, page_width, page_height)
+            verification_score = _ssim_similarity(b_image_bytes, rendered_bytes)
         except Exception:
             break
 
@@ -473,9 +482,9 @@ async def run(job_id: str, b_file_path: str, b_filename: str) -> dict:
         "error": None,
         "schema": schema,
         "html_template": html_template,
-        "preferred_renderer": preferred_renderer,
-        "renderer_warning": renderer_warning,
+        "b_image_bytes": b_image_bytes,
         "complexity_score": complexity_score,
+        "complexity_warning": complexity_warning,
         "verification_score": verification_score,
         "verification_attempts": verification_attempts,
         "prompt_version": PROMPT_VERSION,

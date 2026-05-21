@@ -17,6 +17,8 @@ MODEL_FLASH = "gemini-1.5-flash"
 MODEL_PRO = "gemini-1.5-pro"
 GROUNDING_WARN_THRESHOLD = 80.0
 MAX_CONCURRENT_FIELD_CALLS = 5
+_GENERATION_TEMPLATE = GENERATION_PROMPT_PATH.read_text(encoding="utf-8")
+_SELFRAG_TEMPLATE = SELFRAG_PROMPT_PATH.read_text(encoding="utf-8")
 
 
 def _get_source_content(sections: list, a_source_ids: list) -> str:
@@ -86,7 +88,7 @@ def _load_generation_prompt(
     Returns:
         완성된 생성 프롬프트
     """
-    template = GENERATION_PROMPT_PATH.read_text(encoding="utf-8")
+    template = _GENERATION_TEMPLATE
     return (
         template
         .replace("{{TRANSFORMATION_INTENT}}", intent)
@@ -107,7 +109,7 @@ def _load_selfrag_prompt(source_document: str, generated_text: str) -> str:
     Returns:
         완성된 Self-RAG 프롬프트
     """
-    template = SELFRAG_PROMPT_PATH.read_text(encoding="utf-8")
+    template = _SELFRAG_TEMPLATE
     return (
         template
         .replace("{{SOURCE_DOCUMENT}}", source_document)
