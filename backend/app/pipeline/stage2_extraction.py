@@ -131,20 +131,23 @@ async def run(job_id: str, masked_extracted: dict) -> dict:
     estimated_tokens = len(text) // 4 + 1000
     prompt = _load_prompt(text)
 
+    FAILURE_BASE = {
+        "success": False,
+        "doc_type": "other",
+        "sections": [],
+        "summary": "",
+        "avg_confidence": 0,
+        "prompt_version": PROMPT_VERSION,
+        "model_used": MODEL,
+    }
+
     try:
         raw = await _call_gemini(prompt, estimated_tokens)
         parsed = _parse_response(raw)
     except RuntimeError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "doc_type": "other",
-            "sections": [],
-            "summary": "",
-            "avg_confidence": 0,
-            "prompt_version": PROMPT_VERSION,
-            "model_used": MODEL,
-        }
+        return {**FAILURE_BASE, "error": str(e)}
+    except Exception as e:
+        return {**FAILURE_BASE, "error": f"Gemini 호출 실패: {str(e)}"}
 
     return {
         "success": parsed["parse_success"],

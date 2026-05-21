@@ -197,7 +197,16 @@ def run(file_path: str, filename: str) -> dict:
             warning: str | None,
         }
     """
-    file_bytes = download_from_gcs(file_path)
+    try:
+        file_bytes = download_from_gcs(file_path)
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"GCS 다운로드 실패: {str(e)}",
+            "extension": "",
+            "extracted": {},
+            "warning": None,
+        }
 
     # 1. 파일 검증
     validation = validate_file(filename, file_bytes)
@@ -208,22 +217,30 @@ def run(file_path: str, filename: str) -> dict:
             "success": False,
             "error": validation["error"],
             "extension": extension,
-            "extracted": None,
+            "extracted": {},
             "warning": None,
         }
 
     # 2. 포맷별 분기 처리
     warning = None
-    if extension == ".pdf":
-        extracted = extract_from_pdf(file_bytes)
-    elif extension == ".docx":
-        extracted = extract_from_docx(file_bytes)
-    else:
-        # 이미지의 경우
-        result = validate_image(file_bytes)
-        extracted = {"enhanced_bytes": result["enhanced_bytes"]}
-        warning = result["warning"]
-    
+    try:
+        if extension == ".pdf":
+            extracted = extract_from_pdf(file_bytes)
+        elif extension == ".docx":
+            extracted = extract_from_docx(file_bytes)
+        else:
+            result = validate_image(file_bytes)
+            extracted = {"enhanced_bytes": result["enhanced_bytes"]}
+            warning = result["warning"]
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"파일 처리 실패: {str(e)}",
+            "extension": extension,
+            "extracted": {},
+            "warning": None,
+        }
+
     # 3. 최종 반환 (단일 출구 원칙)
     return {
         "success": True,
