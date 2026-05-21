@@ -121,9 +121,22 @@ B 레이아웃 분석  → gemini-1.5-pro (정확도 필수)
 생성된 각 문장을 Pro에게 재검토시켜 원문 근거 확인. `grounded: false` 문장은 자동 삭제 후 재생성.
 `grounding_score < 80%` 시 사용자 경고.
 
+### Stage 3 B 템플릿 분석 전략
+
+B 파일 타입에 따라 처리 경로가 분기된다:
+- **B가 PDF**: pdfplumber로 폰트명/좌표 직접 추출(정확) + 1페이지 Vision 보완
+- **B가 이미지**: Gemini Pro Vision 단독 분석 + Google Fonts 유사 폰트 3개 추정
+
+**자기검증 루프 (Self-Verification Loop):**
+```
+JSON 추출 → HTML 렌더링(Playwright) → 원본 B와 픽셀 Diff 측정
+→ 유사도 95% 미만 → 차이 영역 크롭 → Gemini 재분석 → JSON 보정
+최대 2회 반복 → 비주얼 에디터로 사용자 전달
+```
+
 ### 렌더러 선택 (Stage 3 → Stage 6)
 
-Stage 3에서 B 레이아웃 복잡도 스코어 산출 후 렌더러 결정.
+complexity_score 기반 자동 결정:
 - 스코어 0~40: WeasyPrint
 - 스코어 40~70: WeasyPrint + 경고
 - 스코어 70+: Playwright (headless Chrome)
