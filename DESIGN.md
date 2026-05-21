@@ -113,7 +113,7 @@
 │  Stage 3:   B 템플릿 분석      ──┘ (복잡도 스코어 포함)      │
 │  Stage 4:   의미론적 매핑 (앙상블)                           │
 │  Stage 5:   콘텐츠 생성 + Self-RAG 환각 검증                │
-│  Stage 6:   문서 조립 (WeasyPrint → Playwright 폴백)        │
+│  Stage 6:   문서 조립 (HTML 조립만, 렌더링 없음)             │
 │  Stage 7:   형식 검증 + PII 복원                            │
 └──────────────────┬───────────────────────────────────────────┘
                    │
@@ -191,8 +191,7 @@ A + B 업로드
 | AI | Gemini 1.5 Flash | latest | 속도 최적화, Pro 3~5배 빠름 |
 | PDF 처리 | PyMuPDF | 1.24+ | 고속 텍스트 추출, AI 불필요 |
 | PDF 처리 | pdfplumber | 0.11+ | 테이블/레이아웃 구조 추출 |
-| 문서 생성 | WeasyPrint | 62+ | HTML/CSS → PDF 변환 (단순~중간 복잡도) |
-| 문서 생성 | Playwright | 1.44+ | 복잡한 레이아웃 PDF 변환 (WeasyPrint 폴백) |
+| 문서 생성 | Playwright | 1.44+ | HTML/CSS → PDF 변환, 자기검증 스크린샷, 최종 PDF 생성 |
 | DB | PostgreSQL | 16 | 구조화 데이터, JSONB 지원 |
 | Cache / Queue | Redis | 7.x | 세션/캐시/Celery 브로커 통합 |
 | 파일 저장소 | Google Cloud Storage | - | Gemini와 동일 생태계 |
@@ -372,16 +371,12 @@ GET    /api/v1/jobs/:id/cost
 
 ```
 지원 출력 형식:
-  PDF  (기본): WeasyPrint 또는 Playwright 렌더링
+  PDF  (기본): Stage 7에서 Playwright로 렌더링
   HTML (미리보기): 브라우저 인라인 렌더링, 다운로드 불가
 
 v2.0 예정:
   DOCX: python-docx 기반 (별도 템플릿 엔진 필요)
   PPTX: python-pptx 기반
-
-형식별 렌더러:
-  PDF → Stage 3 복잡도 스코어 기반 WeasyPrint / Playwright 자동 선택
-  HTML → 항상 직접 렌더링 (렌더러 불필요)
 ```
 
 ### 6.3 WebSocket
@@ -487,10 +482,10 @@ B 파일 타입별 처리 경로:
   커스텀 폰트 수               × 5점
   CSS Grid/Flexbox 적용 구역 수 × 10점
 
-렌더러 결정:
-  스코어 0~40   → WeasyPrint
-  스코어 40~70  → WeasyPrint + 사용자 경고
-  스코어 70+    → Playwright (headless Chrome) 자동 선택
+복잡도 경고:
+  스코어 0~70   → 경고 없음
+  스코어 70+    → "레이아웃이 매우 복잡합니다" 경고 메시지
+  렌더러: 항상 Playwright (headless Chrome)
 
 출력:
   {
@@ -500,9 +495,10 @@ B 파일 타입별 처리 경로:
     font_candidates: [...],
     css_features: [...],
     complexity_score: int,
-    preferred_renderer: 'weasyprint'|'playwright',
+    complexity_warning: str | None,
     html_template: str,
-    verification_score: float,   ← 자기검증 루프 최종 픽셀 유사도
+    b_image_bytes: bytes,         ← Stage 7 SSIM 비교용
+    verification_score: float,   ← 자기검증 루프 최종 SSIM 유사도
     verification_attempts: int,  ← 반복 횟수
   }
 ```
@@ -600,26 +596,11 @@ Self-RAG 환각 검증 (콘텐츠 생성 직후):
 
 ```
 처리:
-  - B HTML 템플릿에 생성된 콘텐츠 삽입
-  - Stage 3에서 결정된 renderer로 PDF 변환
+  - B HTML 템플릿의 {{field_id}} 플레이스홀더에 콘텐츠 삽입 (regex 단일 패스)
+  - 텍스트 정제: 마크다운 볼드 제거, HTML 이스케이프, \n → <br>
+  - PDF 렌더링은 Stage 7에서만 수행 (렌더링 중복 방지)
 
-  렌더러 실행:
-    WeasyPrint 선택 시:
-      → HTML/CSS → PDF 변환
-      → 폰트 로딩 (Google Fonts 서브셋 캐시 사용)
-      → 변환 실패 시 → Playwright로 자동 폴백
-
-    Playwright 선택 시 (또는 WeasyPrint 폴백):
-      → Headless Chromium으로 HTML 렌더링
-      → page.pdf() 호출
-      → 실제 Chrome 엔진 = CSS Grid/Flexbox/절대위치 완전 지원
-      → Docker 이미지에 Chromium 포함 필요
-
-  공통:
-    - 페이지 오버플로우 자동 감지 및 폰트 크기 자동 축소
-    - WeasyPrint 실패 로그 기록 (복잡도 스코어 보정에 활용)
-
-출력: 초안 PDF + HTML 미리보기
+출력: filled_html (PII 마스킹 상태)
 ```
 
 ### Stage 7: 형식 검증 + PII 복원
@@ -806,10 +787,9 @@ Gemini 신규 버전 출시 시:
 | 4 | 필수 B 필드 커버리지 | 미매핑 필수 필드 존재 | 사용자 직접 매핑 |
 | 5 | 생성 텍스트 길이 | B 필드 크기 초과 | 자동 재조정 |
 | 5 | Self-RAG grounding | < 80% | HALLUCINATION 문장 삭제 + 재생성 |
-| 6 | WeasyPrint 렌더링 | 변환 실패 | Playwright 폴백 자동 실행 |
-| 6 | 페이지 오버플로우 | 콘텐츠 잘림 | 폰트 크기 자동 축소 |
-| 7 | 레이아웃 픽셀 유사도 | 95% 미만 | 불일치 섹션 재조립 |
-| 7 | 시각적 완성도 스코어 | 85 미만 | Human Checkpoint 필수 |
+| 6 | 플레이스홀더 미교체 | 잔여 {{field_id}} 존재 | 경고 후 빈 문자열로 대체 |
+| 7 | SSIM 유사도 | 98% 미만 | 비주얼 에디터 권장/필수 |
+| 7 | Playwright 렌더링 실패 | 타임아웃/오류 | 에러 반환, Celery 재시도 |
 | 7 | PII 복원 완료 | 토큰 미복원 존재 | 복원 재시도 후 경고 |
 
 ---
@@ -1144,7 +1124,7 @@ LLMOps 대시보드 (별도 구성):
   - 프롬프트 버전별 품질 비교
   - 모델별 비용 추이 (stage_results.cost_usd 집계)
   - Rate Limiter 사용률 (RPM/TPM 소비 현황)
-  - WeasyPrint vs Playwright 렌더러 사용 비율
+  - Stage 7 SSIM 유사도 분포
 ```
 
 ---
@@ -1179,7 +1159,7 @@ LLMOps 대시보드 (별도 구성):
 ### Phase 4: 문서 생성 (Week 6)
 
 - [ ] Stage 5: 콘텐츠 생성 (변환 타입별) + Self-RAG 환각 검증
-- [ ] Stage 6: WeasyPrint 조립 + Playwright 폴백
+- [ ] Stage 6: HTML 조립 (텍스트 정제 + 단일 패스 교체)
 - [ ] Stage 7: PII 복원 로직
 - [ ] 부분 완료 + 재시도 로직
 - [ ] stage_results 비용 추적 (토큰 수, cost_usd)
@@ -1213,7 +1193,7 @@ LLMOps 대시보드 (별도 구성):
 | Gemini API 비용 예상 초과 | 중간 | 중간 | 컨텍스트 캐싱 + Flash 우선 + 비용 추적 알림 |
 | 35페이지+ 대용량 문서 처리 지연 | 중간 | 중간 | PyMuPDF 전처리로 토큰 절감 |
 | 매핑 정확도 목표(90%) 미달 | 중간 | 높음 | 앙상블 + Human Checkpoint 보완 |
-| WeasyPrint 복잡한 레이아웃 렌더링 실패 | 중간 | 높음 | 복잡도 스코어 기반 Playwright 자동 폴백 |
+| Playwright 렌더링 타임아웃 | 낮음 | 중간 | 30초 타임아웃 + Celery 재시도 |
 | 프롬프트 변경 후 기존 품질 회귀 | 중간 | 높음 | Golden Dataset CI/CD 자동 평가로 배포 차단 |
 | WebSocket 다중 인스턴스 세션 유실 | 중간 | 중간 | Redis Pub/Sub 브로드캐스팅으로 해결 |
 | PII 마스킹 누락으로 개인정보 API 전송 | 낮음 | 매우 높음 | 정규식 다중 패턴 + 감사 로그 검증 |

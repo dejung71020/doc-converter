@@ -9,6 +9,7 @@ PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "stage4_mapping"
 PROMPT_VERSION = "v1.0.0"
 MODEL_PRO = "gemini-1.5-pro"
 MODEL_FLASH = "gemini-1.5-flash"
+_PROMPT_TEMPLATE = PROMPT_PATH.read_text(encoding="utf-8")
 
 AUTO_THRESHOLD = 90.0
 CHECKPOINT_THRESHOLD = 50.0
@@ -81,7 +82,7 @@ def _load_prompt(
     Returns:
         완성된 프롬프트 문자열
     """
-    template = PROMPT_PATH.read_text(encoding="utf-8")
+    template = _PROMPT_TEMPLATE
     return (
         template
         .replace("{{A_DOC_TYPE}}", a_doc_type)

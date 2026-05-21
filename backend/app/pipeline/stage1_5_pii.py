@@ -1,6 +1,5 @@
 import re
 import json
-import asyncio
 
 from app.redis_client import get_redis
 
@@ -91,11 +90,12 @@ async def restore(job_id: str, text: str) -> str:
     return restored_text
 
 
-def run(job_id: str, extracted: dict) -> dict:
+async def run(job_id: str, extracted: dict) -> dict:
     """
-    Stage 1.5 동기 래퍼 함수.
+    Stage 1.5 비동기 실행 함수.
     extracted 딕셔너리 안의 모든 텍스트 필드에 마스킹을 적용한다.
-    Celery Worker(동기 환경)에서 호출되므로 asyncio.run()으로 비동기 함수를 실행한다.
+    tasks.py의 _run_pipeline에서 await로 호출된다.
+    asyncio.run() 대신 await를 사용해 중첩 이벤트 루프 충돌을 방지한다.
 
     Args:
         job_id: 변환 작업 ID
@@ -116,16 +116,16 @@ def run(job_id: str, extracted: dict) -> dict:
             "masked_extracted": extracted,
             "pii_counts": {},
         }
-    
+
     # 복사본으로 작업
     extracted_copy = dict(extracted)
 
     # JSON 직렬화 불가 객체(bytes) 임시 분리
     enhanced_bytes = extracted_copy.pop("enhanced_bytes", None)
-    
+
     # 딕셔너리 전체를 JSON 문자열로 만들어 한 방에 마스킹
     raw_json_str = json.dumps(extracted_copy, ensure_ascii=False)
-    result = asyncio.run(mask(job_id, raw_json_str))
+    result = await mask(job_id, raw_json_str)
 
     # 마스킹된 JSON 문자열을 다시 딕셔너리로 복구
     masked_extracted = json.loads(result["masked_text"])

@@ -8,33 +8,24 @@
 ## 전체 흐름 요약
 
 ```
-[사용자 업로드]
-  A 파일 + B 파일
+[사용자]
+  POST /api/v1/upload/presigned-url  ← A, B 파일 GCS 업로드
+  POST /api/v1/jobs                  ← 파이프라인 시작
+  WS   /ws/v1/jobs/{job_id}          ← 실시간 진행 수신
       │
-      ▼
+      ▼ (Celery Worker: asyncio.run(_run_pipeline(...)))
 ┌─────────────────────────────────────────────────┐
-│ PROFILE 생성 (최초 1회)                          │
-│                                                 │
-│  Stage 1   → 입력 검증 + 파일 전처리             │
-│  Stage 1.5 → PII 감지 + 마스킹                  │
-│  Stage 2   → A 콘텐츠 추출          ┐ 병렬      │
-│  Stage 3   → B 템플릿 분석 + 검증   ┘           │
-│  Stage 4   → 의미론적 매핑 (앙상블)              │
-│  [Human Checkpoint #1: 매핑 계획 확인]           │
-│  → 변환 프로필 저장                              │
-└─────────────────────────────────────────────────┘
-      │
-      ▼
-┌─────────────────────────────────────────────────┐
-│ 변환 적용 (반복 사용)                            │
-│                                                 │
-│  Stage 1   → 새 문서 검증 + 전처리               │
-│  Stage 1.5 → PII 마스킹                         │
-│  Stage 5   → 콘텐츠 생성 + Self-RAG 검증        │
-│  Stage 6   → 문서 조립 (Playwright 렌더링)       │
-│  Stage 7   → 형식 검증 + PII 복원               │
-│  [Human Checkpoint #2: 비주얼 에디터]            │
-│  → 최종 PDF 출력                                │
+│  Stage 1   → 입력 검증 + 전처리 (동기, to_thread) │
+│  Stage 1.5 → PII 감지 + 마스킹  (async)          │
+│  Stage 2   → A 콘텐츠 추출       ┐ asyncio.gather│
+│  Stage 3   → B 템플릿 분석+검증  ┘ 병렬 실행     │
+│  Stage 4   → 의미론적 매핑 (Flash+Pro 앙상블)     │
+│  [Human Checkpoint #1: 일치율 < 50% 시 발동]     │
+│  Stage 5   → 콘텐츠 생성 + Self-RAG (Semaphore)  │
+│  Stage 6   → HTML 조립 (동기, 렌더링 없음)        │
+│  Stage 7   → SSIM 검증 + PII 복원 + PDF 생성     │
+│  [Human Checkpoint #2: SSIM < 98% 시 권장/필수]  │
+│  → GCS 업로드 → job_complete 이벤트 발행         │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -158,6 +149,7 @@ enhanced_bytes 재결합 → 반환
 ```
 
 ### 주요 설계 결정
+- **async def run()**: 이전 asyncio.run() 방식은 Celery 이벤트 루프와 충돌. tasks.py에서 await로 직접 호출
 - **JSON 직렬화 전략**: text만 마스킹하면 sections/tables 안의 PII 누출. 전체를 json.dumps → 마스킹 → json.loads로 3줄에 해결
 - **Redis TTL 의존, 명시적 삭제 금지**: Celery max_retries=3 환경에서 Stage 7 복원 후 재시도 발생 가능. 삭제하면 토큰 복원 불가 → 최종 문서에 [PII_PHONE_001] 그대로 인쇄됨
 - **원본 dict 복사**: extracted.pop()이 호출부 원본을 변형하지 않도록 dict(extracted)로 복사 후 처리
@@ -266,23 +258,23 @@ JSON 스키마 파싱
   {page_size, fields, layout, font_candidates, complexity_score, css_features}
     │
     ▼
-complexity_score → 렌더러 결정
-  0~40:  WeasyPrint
-  40~70: WeasyPrint + 경고 메시지
-  70+:   Playwright (headless Chrome)
+complexity_score → complexity_warning 결정 (렌더러는 항상 Playwright)
+  0~70:  경고 없음
+  70+:   "레이아웃이 매우 복잡합니다" 경고 메시지
     │
     ▼
-┌─────────────────────────────────────┐
-│ 자기검증 루프 (최대 2회)             │
-│                                     │
-│  JSON 스키마 → _build_html_template │
-│      → Playwright 렌더링            │
-│      → PIL 픽셀 유사도 측정          │
-│      → 95% 이상: 루프 종료          │
-│      → 95% 미만: Gemini 재분석 요청 │
-│         (원본 B + 렌더링 결과 비교)  │
-│         → JSON 스키마 보정          │
-└─────────────────────────────────────┘
+┌─────────────────────────────────────────────────┐
+│ 자기검증 루프 (최대 2회)                         │
+│                                                 │
+│  JSON 스키마 → _build_html_template             │
+│      → Playwright 렌더링                        │
+│         (page_size 기반 viewport, 30초 타임아웃) │
+│         (document.fonts.ready 폰트 로딩 대기)   │
+│      → SSIM 유사도 측정 (Stage 7과 동일 기준)   │
+│      → 95% 이상: 루프 종료                      │
+│      → 95% 미만: Gemini 재분석 요청             │
+│         → JSON 스키마 보정                      │
+└─────────────────────────────────────────────────┘
     │
     ▼
 최종 HTML 템플릿 + 검증 결과 반환
@@ -295,10 +287,11 @@ complexity_score → 렌더러 결정
     "error":                 str | None,
     "schema":                dict,     # 최종 JSON 스키마
     "html_template":         str,      # Stage 6에서 콘텐츠 채워넣을 HTML
-    "preferred_renderer":    str,      # weasyprint | playwright
+    "complexity_warning":    str | None, # 복잡도 높을 때 경고 메시지
     "renderer_warning":      str | None,
     "complexity_score":      int,
-    "verification_score":    float,    # 최종 픽셀 유사도
+    "b_image_bytes":          bytes,    # Stage 7 SSIM 비교용으로 전달
+    "verification_score":    float,    # 최종 SSIM 유사도
     "verification_attempts": int,      # 루프 실행 횟수
     "prompt_version":        str,
     "model_used":            str,
@@ -314,13 +307,15 @@ complexity_score → 렌더러 결정
 
 ### 주요 설계 결정
 - **PDF → pdfplumber 우선**: 이미지 분석만으로는 폰트명 추정 불가. PDF 파일 구조에서 직접 추출
-- **자기검증 루프**: 한 번 생성으로 끝내지 않고 실제 렌더링 결과를 원본과 비교해 AI가 스스로 교정
+- **SSIM 유사도**: Stage 7과 동일한 알고리즘 사용 → 자기검증과 최종 검증의 기준 일관성 유지
+- **page_size 기반 렌더링**: 추출된 page_size로 viewport 설정해 원본 B와 동일한 크기로 비교
+- **타임아웃 30초 + 폰트 대기**: `document.fonts.ready` 대기로 폰트 미로딩 스크린샷 방지
 - **_refine_schema Fallback**: Rate Limit 초과 또는 파싱 실패 시 현재 스키마 유지 → 파이프라인 중단 방지
-- **타임아웃 10초**: 구글 폰트 서버 장애나 잘못된 CSS 무한 루프 방지
+- **프롬프트 캐싱**: 모듈 로드 시 1회만 디스크 읽기 (_PROMPT_TEMPLATE 모듈 상수)
 
 ---
 
-## Stage 4: 의미론적 매핑 (구현 예정)
+## Stage 4: 의미론적 매핑
 
 **파일:** `backend/app/pipeline/stage4_mapping.py`
 
@@ -329,13 +324,12 @@ Stage 2의 A 콘텐츠와 Stage 3의 B 필드 스키마를 받아
 "A의 어떤 내용이 B의 어느 필드로 가야 하는지" 결정한다.
 Flash + Pro 앙상블로 매핑의 정확도를 높인다.
 
-### 핵심 설계 (예정)
+### 핵심 설계
 ```
-Step 1: A doc_type + B doc_type으로 변환 의도 파악
-        예) resume → cover_letter = "경력을 확장해서 회사 맞춤 자기소개로"
+Step 1: asyncio.gather로 Flash + Pro 병렬 매핑 생성
 
-Step 2: Flash 1회 + Pro 1회 병렬 매핑 생성
-        일치율 ≥ 90% → Pro 결과 자동 채택
+Step 2: 필드별 일치율 계산
+        일치율 ≥ 90% → Pro 결과 자동 채택, mismatch_fields=[]
         일치율 50~90% → Pro 결과 채택 + 불일치 필드 사용자 알림
         일치율 < 50%  → Human Checkpoint #1 강제 발동
 
@@ -372,55 +366,63 @@ grounding_score < 80% → 사용자 경고
 
 ---
 
-## Stage 6: 문서 조립 (구현 예정)
+## Stage 6: 문서 조립
 
 **파일:** `backend/app/pipeline/stage6_assembly.py`
 
 ### 목적
-Stage 3의 HTML 템플릿에 Stage 5의 생성 콘텐츠를 채워넣고
-Playwright로 최종 PDF를 렌더링한다.
+Stage 3의 HTML 템플릿에 Stage 5의 생성 콘텐츠를 채워넣는 문자열 조립만 수행한다.
+**PDF 렌더링은 Stage 7에서만 한 번 수행한다** (렌더링 중복 방지).
 
 ### 핵심 흐름
 ```
-HTML 템플릿의 {{field_id}} 플레이스홀더에 콘텐츠 삽입
+{{field_id}} 플레이스홀더를 regex 단일 패스로 치환
+  (순차 교체 시 콘텐츠 안의 {{...}}가 재교체되는 버그 방지)
     │
     ▼
-렌더러 선택 (Stage 3에서 결정된 preferred_renderer)
-  weasyprint → WeasyPrint PDF 변환
-               실패 시 → Playwright 자동 폴백
-  playwright → Playwright headless Chrome PDF 변환
+_clean_and_format_text 텍스트 정제
+  마크다운 볼드(**) 제거
+  HTML 이스케이프 (XSS 방지)
+  \n → <br> 변환
     │
     ▼
-페이지 오버플로우 감지 → 폰트 크기 자동 축소
-    │
-    ▼
-초안 PDF + HTML 미리보기 반환
+filled_html 반환 (PII 마스킹 상태, Stage 7에서 복원)
 ```
+
+### 주요 설계 결정
+- **동기 함수 (def, not async)**: await 없음. Celery에서 직접 호출
+- **렌더링 없음**: Stage 7이 Playwright 단일 세션으로 스크린샷+PDF 동시 처리하므로 여기서 렌더링하면 2배 낭비
 
 ---
 
-## Stage 7: 형식 검증 + PII 복원 (구현 예정)
+## Stage 7: 형식 검증 + PII 복원
 
 **파일:** `backend/app/pipeline/stage7_validation.py`
 
 ### 목적
-최종 출력물의 형식이 B와 일치하는지 검증하고
-Stage 1.5에서 마스킹한 PII를 원본으로 복원한다.
+최종 HTML을 원본 B와 SSIM으로 시각적 유사도를 검증하고,
+PII를 복원한 후 최종 PDF를 생성해 GCS에 업로드한다.
 
 ### 핵심 흐름
 ```
-Gemini Pro로 레이아웃 픽셀 Diff 검증
-  유사도 98% 이상 → 자동 완료
-  90~98%         → 비주얼 에디터 권장
-  90% 미만       → 해당 섹션 재조립 후 비주얼 에디터 필수
-    │
-    ▼
 PII 복원 (stage1_5_pii.restore 호출)
-  Redis에서 토큰맵 로드 → 토큰을 원본값으로 치환
-  주의: redis.delete 하지 않음 (Celery 재시도 대비)
+  Redis TTL 의존, 명시적 삭제 안 함 (Celery 재시도 대비)
     │
     ▼
-최종 PDF GCS 업로드 → 다운로드 URL 반환
+단일 Playwright 세션으로:
+  1. 스크린샷 (마스킹 상태 HTML → SSIM 비교용)
+  2. 최종 PDF (복원된 HTML → 사용자 전달용)
+  30초 타임아웃 + document.fonts.ready 대기
+  page_size 기반 viewport, full_page=True, 멀티페이지 지원
+    │
+    ▼
+SSIM 유사도 측정
+  98% 이상 → 자동 완료
+  90~98%   → 비주얼 에디터 권장
+  90% 미만 → 비주얼 에디터 필수
+    │
+    ▼
+최종 PDF GCS 업로드 → final_pdf_path 반환
 ```
 
 ---
@@ -447,4 +449,20 @@ Stage 7 검증 후 픽셀 유사도가 목표치 미달 시 발동.
 | Rate Limiter 필수 | 모든 Gemini 호출 전 rate_limiter.acquire() 통과 |
 | 비동기 일관성 | Gemini 호출은 generate_content_async() 사용, 동기 함수 안 호출 금지 |
 | PII 안전 | 감사 로그에 실제 PII 값 절대 포함 금지, Redis TTL 의존 |
+| 프롬프트 캐싱 | 모듈 상수로 로드 (_PROMPT_TEMPLATE), 매 호출마다 디스크 읽기 금지 |
+| Gemini 싱글톤 | gemini_client.py의 model_pro/model_flash 재사용, 매 호출마다 생성 금지 |
 | 프롬프트 버전 | 모든 AI 호출에 PROMPT_VERSION 기록 (LLMOps 추적) |
+
+## Celery ↔ Async 경계
+
+```
+Celery Task (동기):
+  asyncio.run(_run_pipeline(...))  ← 단일 진입점
+      │
+  _run_pipeline (비동기):
+      Stage 1:   asyncio.to_thread(stage1_validation.run, ...)  ← 동기 함수
+      Stage 1.5: await stage1_5_pii.run(...)                   ← 비동기
+      Stage 2+3: await asyncio.gather(...)                     ← 병렬 비동기
+      Stage 4~7: await stage_X.run(...)                        ← 비동기
+      Stage 6:   stage6_assembly.run(...)                      ← 동기 (await 없음)
+```

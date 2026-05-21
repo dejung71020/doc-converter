@@ -20,7 +20,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | Backend | Python FastAPI (async), Celery 5.x |
 | AI | Gemini 1.5 Pro (정확도), Gemini 1.5 Flash (속도) |
 | PDF 처리 | PyMuPDF (텍스트 추출), pdfplumber (레이아웃) |
-| 문서 생성 | WeasyPrint → Playwright 폴백 (복잡 레이아웃) |
+| 문서 생성 | Playwright (headless Chrome) — Stage 7에서 최종 PDF 렌더링 |
 | DB | PostgreSQL 16 (JSONB 활용) |
 | Cache / Queue | Redis 7 (캐시 + Celery 브로커 + Pub/Sub + Rate Limiter) |
 | 파일 저장소 | Google Cloud Storage |
@@ -42,7 +42,7 @@ doc-converter/
 │   │   │   ├── stage3_template.py
 │   │   │   ├── stage4_mapping.py     # 앙상블 매핑
 │   │   │   ├── stage5_generation.py  # Self-RAG 포함
-│   │   │   ├── stage6_assembly.py    # WeasyPrint/Playwright
+│   │   │   ├── stage6_assembly.py    # HTML 조립 (렌더링 없음)
 │   │   │   └── stage7_validation.py
 │   │   ├── ai/
 │   │   │   ├── gemini_client.py      # Gemini API 래퍼
@@ -74,14 +74,14 @@ doc-converter/
 각 Stage는 독립적으로 재시도 가능하다. 전체 파이프라인 재시작 없이 실패한 Stage만 재처리한다.
 
 ```
-Stage 1   → 입력 검증 + PyMuPDF 전처리
-Stage 1.5 → PII 감지 + 마스킹 (Gemini 전송 전 필수)
-Stage 2   → A 콘텐츠 추출           ┐ 병렬 실행
-Stage 3   → B 템플릿 분석            ┘ (복잡도 스코어 → 렌더러 결정)
+Stage 1   → 입력 검증 + PyMuPDF/python-docx 전처리 (동기, asyncio.to_thread로 호출)
+Stage 1.5 → PII 감지 + 마스킹 (async, Gemini 전송 전 필수)
+Stage 2   → A 콘텐츠 추출           ┐ asyncio.gather로 병렬 실행
+Stage 3   → B 템플릿 분석            ┘ (SSIM 자기검증 루프, b_image_bytes 반환)
 Stage 4   → 의미론적 매핑 (Flash + Pro 앙상블)
-Stage 5   → 콘텐츠 생성 + Self-RAG 환각 검증
-Stage 6   → 문서 조립 (WeasyPrint, 실패 시 Playwright 자동 폴백)
-Stage 7   → 형식 검증 + PII 복원
+Stage 5   → 콘텐츠 생성 + Self-RAG 환각 검증 (Semaphore 5로 동시 실행 제한)
+Stage 6   → HTML 템플릿 + 콘텐츠 조립 (동기, 렌더링 없음)
+Stage 7   → SSIM 검증 + PII 복원 + Playwright PDF 생성 + GCS 업로드
 ```
 
 ### WebSocket 실시간 이벤트 (멀티 인스턴스 대응)
@@ -134,13 +134,19 @@ JSON 추출 → HTML 렌더링(Playwright) → 원본 B와 픽셀 Diff 측정
 최대 2회 반복 → 비주얼 에디터로 사용자 전달
 ```
 
-### 렌더러 선택 (Stage 3 → Stage 6)
+### 렌더링 전략
 
-complexity_score 기반 자동 결정:
-- 스코어 0~40: WeasyPrint
-- 스코어 40~70: WeasyPrint + 경고
-- 스코어 70+: Playwright (headless Chrome)
-- WeasyPrint 런타임 실패 시 → Playwright 자동 폴백
+Stage 7이 Playwright 단일 세션으로 스크린샷(SSIM 검증용) + 최종 PDF를 한 번에 생성한다.
+Stage 3의 `preferred_renderer`(complexity_score 기반)는 계산되지만 현재 Stage 7은 항상 Playwright 사용.
+Stage 6은 렌더링 없이 HTML 조립만 수행 (렌더링 중복 방지).
+
+### API 엔드포인트
+
+```
+POST /api/v1/upload/presigned-url  ← GCS 직접 업로드용 Signed URL 발급
+POST /api/v1/jobs                  ← 변환 작업 생성 + Celery 파이프라인 시작
+WS   /ws/v1/jobs/{job_id}         ← 실시간 진행 상황 수신
+```
 
 ---
 
